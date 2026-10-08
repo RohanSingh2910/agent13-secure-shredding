@@ -1,0 +1,22 @@
+/build/
+/debian/agent13/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper
+/debian/debhelper-build-stamp
+__pycache__/
+*.pyc
+*.deb
+*.buildinfo
+*.changes
+
+# Local credentials, workspace settings and Python environments.
+/.aws/
+/.codex/
+/.agents/
+.env
+.env.*
+!.env.example
+.venv/
+venv/

@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: agent13
+
+Files: *
+Copyright: 2026 OS Lab project contributors
+License: project-pending
+ This academic project has no selected redistribution license yet.
+ The class maintainers should select a license and update this file before
+ public redistribution. This notice does not apply to Project_Overview.txt,
+ whose author and permission should be confirmed with the course instructor.

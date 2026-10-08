@@ -1,0 +1,229 @@
+Your class is collaboratively building a next-generation "Agentic Shell" for Linux. Instead of forcing users to memorize complex flags (like tar -xzvf or ps aux | grep), this shell accepts Natural Language commands and autonomously executes the underlying system operations.
+
+The Architecture:
+
+    The Base Shell: A master loop that accepts user text and uses an LLM to "route" the intent to one of 35 specialized Agents.
+    The Agents (Your Assignment): Each pair is assigned one domain-specific Agent.
+    How your Agent works: You must write Python/C code that defines specific Linux capabilities as "Tools" (Function Calling). When your agent receives the user's prompt, the LLM will decide which of your tools to execute. Your code will then interface with the Real-Time OS via System Calls (os, subprocess, libc) to apply the changes.
+
+
+
+Process & CPU Management Agents
+
+1. Process Hunter Agent
+
+    Prompt Example: "Kill the python script that has been taking up 90% CPU for the last 5 minutes."
+    Functionality: Identifies processes based on semantic criteria (CPU/RAM usage, duration, name) and safely terminates them.
+    How to Achieve It: Expose a get_process_metrics() tool (parsing /proc or ps aux) and a send_signal(pid, sig) tool (wrapping the kill() system call). The LLM analyzes the metrics to find the target PID and executes the kill tool.
+
+2. Zombie & Orphan Reaper Agent
+
+    Prompt Example: "Find all zombie processes on my system and clean them up."
+    Functionality: Detects defunct processes and identifies their parent. If the parent is stuck, it offers to restart or kill the parent to reap the zombie.
+    How to Achieve It: Use ps -eo stat,pid,ppid,comm to find 'Z' state processes. Expose tools for the LLM to trace the parent process ID (PPID) and send SIGCHLD or SIGKILL.
+
+3. CPU Affinity & Priority Agent
+
+    Prompt Example: "Make my video rendering process run only on the background cores with low priority."
+    Functionality: Dynamically changes process execution priority and binds processes to specific CPU cores.
+    How to Achieve It: Expose the taskset command (or sched_setaffinity syscall) and renice (or setpriority syscall) as tools for the LLM.
+
+4. Process Tree & Ancestry Agent
+
+    Prompt Example: "Why is 'nginx' running? Show me what started it."
+    Functionality: Reconstructs the execution tree to explain the origin of a process.
+    How to Achieve It: Traverse the /proc/[pid]/stat files to map out PPIDs up to init (PID 1). Pass this tree to the LLM to generate a natural language explanation of the ancestry.
+
+5. Background Job Manager Agent
+
+    Prompt Example: "Run this massive database dump in the background and notify me when it's done."
+    Functionality: Handles shell process detachment, standard output redirection, and asynchronous completion notifications.
+    How to Achieve It: Use fork(), setsid(), and nohup logic to decouple the process from the terminal. Expose a tool that monitors the PID and triggers a shell alert upon exit.
+
+6. IPC (Inter-Process Communication) Cleaner Agent
+
+    Prompt Example: "Clean up any abandoned shared memory segments taking up RAM."
+    Functionality: Audits System V IPC (Shared Memory, Message Queues, Semaphores) for leaks.
+    How to Achieve It: Provide tools that parse the output of ipcs and execute ipcrm. The LLM decides which segments have zero attachments and purges them.
+
+File System & Storage Agents
+
+7. Semantic File Search Agent
+
+    Prompt Example: "Find the config file I edited yesterday that has the database password in it."
+    Functionality: Replaces complex find and grep pipelines. Searches based on time, metadata, and content.
+    How to Achieve It: Expose tools like search_by_metadata(time, type) and search_file_content(regex). The LLM converts the user's natural language into the optimal search strategy.
+
+8. Disk Quota & Space Optimizer Agent
+
+    Prompt Example: "I'm out of space. Free up 5GB in my home directory by deleting old downloads."
+    Functionality: Analyzes disk usage and safely removes files based on user constraints.
+    How to Achieve It: Wrap du, df, and stat. The LLM uses these tools to build a list of candidate files, calculates the total size, and calls a delete_files() tool.
+
+9. Smart Permissions & ACL Agent
+
+    Prompt Example: "Make the 'www' folder accessible to the web server, but strictly read-only for everyone else."
+    Functionality: Translates human intent into complex chmod, chown, or Access Control List (ACL) commands.
+    How to Achieve It: Expose a set_permissions(path, user, group, read, write, exec) tool. The LLM translates the intent into the correct octal or ACL mappings.
+
+10. Inode & Symlink Auditor Agent
+
+    Prompt Example: "Find all broken shortcuts on my desktop and delete them."
+    Functionality: Navigates the filesystem to identify dangling symlinks and manage hard links.
+    How to Achieve It: Use lstat() to check link targets. The LLM processes lists of links and calls an unlink() tool for broken ones.
+
+11. Directory Watcher Agent
+
+    Prompt Example: "Watch my downloads folder and automatically move any PDF files to my Documents."
+    Functionality: Sets up asynchronous file system watches.
+    How to Achieve It: Implement a daemon using the inotify Linux API. The LLM generates the filtering logic (e.g., *.pdf) and the action (e.g., mv).
+
+12. Smart Archive Agent
+
+    Prompt Example: "Zip up my project folder, compress it heavily, and encrypt it."
+    Functionality: Eliminates the need to remember tar flags. Handles compression and encryption seamlessly.
+    How to Achieve It: Provide the LLM with tools for tar, gzip, bzip2, and gpg. The LLM chains these together based on the words "heavily" and "encrypt".
+
+13. Secure Shredding Agent
+
+    Prompt Example: "Delete my tax returns so they can never be recovered."
+    Functionality: securely overwrites data blocks on the disk before unlinking the inode.
+    How to Achieve It: Wrap the shred utility or write a C function that opens the file descriptor, overwrites it with random bytes using /dev/urandom, calls fsync(), and deletes it.
+
+14. Mount & Partition Agent
+
+    Prompt Example: "Mount this ubuntu.iso file so I can look at the files inside."
+    Functionality: Translates natural language into block device mapping and loopback mounts.
+    How to Achieve It: Expose tools for lsblk, losetup, and the mount() system call. The LLM identifies the target format and issues the mount command to a temporary /mnt path.
+
+15. Log Rotator Agent
+
+    Prompt Example: "Zip up the apache error logs from last month and clear the current file."
+    Functionality: Manages bloated files without interrupting the running processes writing to them.
+    How to Achieve It: The LLM uses tools to copy the log, compress it, and safely truncate the original file using the truncate() system call.
+
+Network & Sockets Agents
+
+16. Port Sentinel Agent
+
+    Prompt Example: "What process is hogging port 8080? Stop it."
+    Functionality: Maps network sockets to PIDs and manages them.
+    How to Achieve It: Parse /proc/net/tcp or wrap ss -lptn. The LLM identifies the PID holding the port and uses the kill tool to release it.
+
+17. Network Interface Configurator Agent
+
+    Prompt Example: "Turn off my Wi-Fi and show me my Ethernet IP address."
+    Functionality: Manages network links and routing tables.
+    How to Achieve It: Expose the ip link and ip addr APIs (Netlink sockets). The LLM issues state changes (set down) and formats the IP output.
+
+18. Smart Firewall Agent
+
+    Prompt Example: "Block all incoming traffic from IP 192.168.1.50, but let them SSH in."
+    Functionality: Translates human security rules into iptables or ufw syntax.
+    How to Achieve It: Give the LLM a tool add_firewall_rule(protocol, port, source, action). The LLM parses the prompt and generates the correct parameters.
+
+19. Bandwidth Hog Detector Agent
+
+    Prompt Example: "Why is my internet so slow right now? Which app is downloading data?"
+    Functionality: Monitors active socket throughput to identify heavy network users.
+    How to Achieve It: Wrap a tool like nethogs or parse /proc/net/dev. The LLM analyzes the byte deltas and reports the application name.
+
+20. Connectivity Diagnostics Agent
+
+    Prompt Example: "I can't reach Google. Figure out where the connection is dropping."
+    Functionality: Autonomously troubleshoots the OSI model (DNS, routing, remote host).
+    How to Achieve It: The LLM is given ping, traceroute, and nslookup tools. It runs DNS checks first, then pings the gateway, then traces the route, and formulates a diagnostic report.
+
+21. SSH Key Manager Agent
+
+    Prompt Example: "Generate a new secure SSH key and copy it to my server at 10.0.0.5."
+    Functionality: Automates cryptographic key generation and deployment.
+    How to Achieve It: Provide tools for ssh-keygen and ssh-copy-id. The LLM sequences the creation and the remote payload deployment.
+
+22. Active Connections Auditor Agent
+
+    Prompt Example: "Are there any weird outbound connections to unknown foreign IPs right now?"
+    Functionality: Maps established TCP/UDP connections and uses a GeoIP lookup.
+    How to Achieve It: The LLM uses netstat/ss to get foreign IPs, calls an external GeoIP API tool, and flags unusual locations.
+
+Users, Groups & Security Agents
+
+23. User Provisioning Agent
+
+    Prompt Example: "Create a new user named Alice, give her a home directory, and add her to the docker group."
+    Functionality: Manages /etc/passwd, /etc/group, and directory initialization.
+    How to Achieve It: Wrap useradd, usermod, and mkdir. The LLM translates the requirements into the appropriate flags.
+
+24. Password & Policy Agent
+
+    Prompt Example: "Force Bob to change his password the next time he logs in."
+    Functionality: Manipulates shadow password expiry rules.
+    How to Achieve It: Expose the chage command. The LLM translates "next time he logs in" to chage -d 0 bob.
+
+25. Sudoers Configurator Agent
+
+    Prompt Example: "Let Alice restart the web server without needing a password, but nothing else."
+    Functionality: Safely modifies the highly sensitive /etc/sudoers file.
+    How to Achieve It: The LLM uses a tool to generate a sudoers rule string (e.g., alice ALL=(ALL) NOPASSWD: /bin/systemctl restart apache2) and securely appends it via visudo -c.
+
+26. Login Auditor Agent
+
+    Prompt Example: "Show me if anyone has logged in as root outside of business hours this week."
+    Functionality: Parses security logs to find temporal anomalies.
+    How to Achieve It: Provide the LLM with the output of last and /var/log/auth.log. The LLM filters the timestamps based on the "business hours" logic.
+
+27. Linux Capabilities Agent
+
+    Prompt Example: "Give the python executable permission to open port 80 without making it run as root."
+    Functionality: Applies fine-grained kernel capabilities instead of dangerous SUID bits.
+    How to Achieve It: Expose setcap and getcap. The LLM maps "open port 80" to CAP_NET_BIND_SERVICE and applies it.
+
+28. File Integrity & Tamper Agent
+
+    Prompt Example: "Generate a checksum for my config folder, and tell me if any files were modified since yesterday."
+    Functionality: Creates and verifies cryptographic hashes of critical files.
+    How to Achieve It: The LLM uses sha256sum to map a directory tree, stores it in a hidden JSON file, and can re-run the tool later to diff the hashes.
+
+System, Services & Hardware Agents
+
+29. Memory & Swap Optimizer Agent
+
+    Prompt Example: "My computer is lagging. Free up some RAM cache and check for memory leaks."
+    Functionality: Manages the Linux page cache and swap space.
+    How to Achieve It: The LLM can execute a tool that writes 3 to /proc/sys/vm/drop_caches to free pagecache/dentries, and analyzes smem or top to identify leaking processes.
+
+30. Kernel Module Driver Agent
+
+    Prompt Example: "My webcam isn't working. Try reloading the video drivers."
+    Functionality: Safely interacts with Ring 0 loadable kernel modules (LKMs).
+    How to Achieve It: Give the LLM tools for lsmod, rmmod, and modprobe. The LLM identifies the uvcvideo module and cycles it.
+
+31. Systemd Service Agent
+
+    Prompt Example: "Restart the database service and make sure it automatically starts when the computer boots."
+    Functionality: Controls system daemons via init systems.
+    How to Achieve It: Expose systemctl. The LLM translates the prompt into systemctl restart db and systemctl enable db.
+
+32. Cron & Automation Agent
+
+    Prompt Example: "Run my database backup script every Friday at midnight."
+    Functionality: Translates natural language into Unix Cron syntax.
+    How to Achieve It: The LLM generates the cron expression (0 0 * * 5), and a tool injects it safely into the user's crontab via crontab -l | crontab -.
+
+33. Hardware Introspection Agent
+
+    Prompt Example: "What kind of RAM do I have installed, and do I have any empty slots?"
+    Functionality: Queries hardware buses (PCI, USB, DMI).
+    How to Achieve It: The LLM parses the output of dmidecode -t memory or lshw to answer specific hardware queries in plain English.
+
+34. Power Management Agent
+
+    Prompt Example: "Put my laptop into maximum battery saving mode."
+    Functionality: Modifies CPU scaling governors and screen brightness.
+    How to Achieve It: The LLM executes tools that write powersave to /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor.
+
+35. Kernel Panic & Dmesg Agent
+
+    Prompt Example: "Why did my USB drive suddenly disconnect? Check the kernel logs."
+    Functionality: Acts as a sysadmin analyzing the kernel ring buffer.
+    How to Achieve It: Expose dmesg or journalctl -k. The LLM reads the last 100 lines, looks for USB subsystem disconnect errors, and explains the hardware fault.

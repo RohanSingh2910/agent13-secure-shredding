@@ -1,0 +1,23 @@
+name: Ubuntu 22.04 validation
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build-test-package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ubuntu build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 debhelper dpkg-dev
+      - name: Build and verify
+        run: make check
+      - name: Verify user unit syntax
+        run: |
+          make install DESTDIR="$RUNNER_TEMP/agent13-stage" PREFIX=/usr
+          systemd-analyze --user verify "$RUNNER_TEMP/agent13-stage/usr/lib/systemd/user/agent13.service"
+      - name: Build Debian package
+        run: dpkg-buildpackage -us -uc -b
+      - name: Inspect Debian package
+        run: dpkg-deb --info ../agent13_*.deb && dpkg-deb --contents ../agent13_*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent13-ubuntu22-deb
+          path: ../agent13_*.deb
