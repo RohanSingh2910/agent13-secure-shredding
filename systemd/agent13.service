@@ -1,0 +1,30 @@
+[Unit]
+Description=Agent 13 standalone secure shredding service
+Documentation=file:%h/.local/lib/agent13/README.md
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m agent13.service --allowed-root %h/.local/share/agent13/allowed --socket %t/agent13/agent13.sock
+WorkingDirectory=%h/.local/lib/agent13
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=agent13
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+Restart=on-failure
+RestartSec=3
+# Wait for the current bounded file operation rather than killing it midway.
+# Administrators may still force termination; see the recovery documentation.
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

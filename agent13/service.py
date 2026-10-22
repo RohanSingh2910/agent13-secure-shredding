@@ -1,258 +1,267 @@
-"""Foreground daemon supervised by systemd, with a native overwrite engine."""
+"""Long-running, single-worker Unix socket service. No master agent needed."""
 
 import argparse
+from dataclasses import dataclass
+import errno
 import fcntl
-import json
 import logging
 import os
+from pathlib import Path
 import secrets
+import selectors
 import signal
 import socket
 import stat
 import struct
 import time
-from pathlib import Path
 
-from . import __version__
-from .client import MAX_MESSAGE, default_socket
-from .native import Engine, NativeError
+from . import __version__, protocol
+from .native import Backend, NativeError, open_absolute_directory
 
-LIMITATION = ("Best-effort logical file overwrite only. SSD wear leveling, copy-on-write, "
-              "snapshots, journals and backups can retain data; physical erasure is not guaranteed.")
+LOG = logging.getLogger("agent13")
 
 
-class RequestError(Exception):
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
-
-
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
+@dataclass
+class Confirmation:
+    path: str
+    fingerprint: object
+    expires: float
 
 
 class Agent:
-    def __init__(self, root, max_bytes=64 * 1024 * 1024, ttl=120, max_plans=32, library=None):
-        self.root = str(Path(root).resolve(strict=True))
-        self.engine = Engine(self.root, max_bytes, library)
-        self.ttl, self.max_plans = ttl, max_plans
-        self.plans = {}
+    def __init__(self, backend, token_ttl=60, max_bytes=64 * 1024 * 1024,
+                 max_tokens=256, clock=time.monotonic):
+        self.backend, self.token_ttl, self.max_bytes = backend, token_ttl, max_bytes
+        self.max_tokens, self.clock = max_tokens, clock
+        self.tokens = {}
 
-    def expire(self):
-        now = time.monotonic()
-        for token, plan in list(self.plans.items()):
-            if plan["deadline"] <= now:
-                self.engine.free(self.plans.pop(token)["handle"])
+    def dispatch(self, request):
+        action, params = request["action"], request["parameters"]
+        if action == "health":
+            return {"status": "ok", "service": "agent13", "abi_version": 1}
+        if action == "info":
+            return {"name": "Secure Shredding Agent", "agent_id": 13,
+                    "release": __version__, "phase": "A: standalone",
+                    "allowed_root": self.backend.allowed_root,
+                    "default_dry_run": True, "passes": 1,
+                    "token_ttl_seconds": self.token_ttl, "max_bytes": self.max_bytes,
+                    "limitations": protocol.LIMITATIONS,
+                    "recovery_directories": ".agent13-stage-*; see docs/DEMO.md"}
+        if action == "execute_shred":
+            # Consume even on mismatch/failure. No destructive automatic retry.
+            token = self.tokens.pop(params["confirm_token"], None)
+            if token is None:
+                raise protocol.RequestError("INVALID_TOKEN", "Token is unknown, already consumed, or lost on service restart")
+            if self.clock() >= token.expires:
+                raise protocol.RequestError("EXPIRED_TOKEN", "Preview again to obtain a fresh token")
+            path = self.backend.relative_path(params["path"])
+            if path != token.path:
+                raise protocol.RequestError("TOKEN_MISMATCH", "Token belongs to a different path; preview again")
+            result = self.backend.shred(path, token.fingerprint)
+            return {**result, "dry_run": False, "limitations": protocol.LIMITATIONS}
+        path = self.backend.relative_path(params["path"])
+        info = self.backend.inspect(path)
+        result = {"path": path, "file": info.as_dict(), "dry_run": True,
+                  "limitations": protocol.LIMITATIONS}
+        if action == "preview_shred":
+            if info.size > self.max_bytes:
+                raise protocol.RequestError("FILE_TOO_LARGE", "File exceeds the configured maximum size")
+            now = self.clock()
+            self.tokens = {key: value for key, value in self.tokens.items() if value.expires > now}
+            if len(self.tokens) >= self.max_tokens:
+                raise protocol.RequestError("TOKEN_LIMIT", "Too many pending previews; wait for expiry")
+            value = secrets.token_urlsafe(32)
+            self.tokens[value] = Confirmation(path, info, now + self.token_ttl)
+            result.update(confirm_token=value, expires_in_seconds=self.token_ttl)
+        return result
 
-    def close(self):
-        for plan in self.plans.values():
-            self.engine.free(plan["handle"])
-        self.plans.clear()
-        self.engine.close()
-
-    def dispatch(self, tool, args, uid):
-        self.expire()
-        if not isinstance(args, dict):
-            raise RequestError("invalid_request", "arguments must be an object")
-        allowed = {
-            "agent13_health": set(),
-            "agent13_plan": {"path", "passes", "zero_pass"},
-            "agent13_execute": {"token", "acknowledge_limitations"},
-            "agent13_cancel": {"token"},
-        }
-        if not isinstance(tool, str) or tool not in allowed:
-            raise RequestError("unknown_tool", "unknown agent13 tool")
-        if set(args) - allowed[tool]:
-            raise RequestError("invalid_request", "unexpected argument")
-        if tool == "agent13_health":
-            return {"agent": 13, "version": __version__, "pid": os.getpid(),
-                    "uid": os.geteuid(), "root": self.root, "pending_plans": len(self.plans),
-                    "max_bytes": self.engine.max_bytes, "plan_ttl_seconds": self.ttl,
-                    "limitation": LIMITATION}
-        if tool == "agent13_plan":
-            path = args.get("path")
-            passes, zero = args.get("passes", 3), args.get("zero_pass", False)
-            if (not isinstance(path, str) or not path or "\x00" in path or
-                    len(path.encode("utf-8")) > 4095):
-                raise RequestError("invalid_request", "path must be a nonempty UTF-8 string without NUL, at most 4095 bytes")
-            if type(passes) is not int or not 1 <= passes <= 7 or type(zero) is not bool:
-                raise RequestError("invalid_request", "passes must be an integer 1..7; zero_pass must be boolean")
-            if len(self.plans) >= self.max_plans:
-                raise RequestError("busy", "too many pending plans; cancel one or wait for expiry")
-            handle, info = self.engine.prepare(path)
-            token = secrets.token_urlsafe(32)
-            self.plans[token] = {"handle": handle, "uid": uid, "deadline": time.monotonic() + self.ttl,
-                                 "passes": passes, "zero": zero}
-            return {"token": token, "path": path, "file": info, "passes": passes,
-                    "zero_pass": zero, "expires_in_seconds": self.ttl,
-                    "operation": "overwrite_then_unlink", "limitation": LIMITATION}
-        token = args.get("token")
-        if not isinstance(token, str) or len(token) > 128:
-            raise RequestError("invalid_request", "token must be a bounded string")
-        plan = self.plans.get(token)
-        if not plan or plan["uid"] != uid:
-            raise RequestError("invalid_token", "token is unknown, expired, consumed, or belongs to another user")
-        if tool == "agent13_cancel":
-            self.engine.free(self.plans.pop(token)["handle"])
-            return {"cancelled": True}
-        if args.get("acknowledge_limitations") is not True:
-            raise RequestError("acknowledgement_required", "review the plan and set acknowledge_limitations to true to authorize execution")
-        self.plans.pop(token)  # A failed attempt must never be retried with this token.
+    def handle(self, raw):
+        request_id, action = None, "invalid"
         try:
-            result = self.engine.execute(plan["handle"], plan["passes"], plan["zero"])
-            logging.info("execute success bytes_written=%d", result["bytes_written"])
-            return {"status": "overwritten_and_unlinked", "file": result,
-                    "physical_erasure_guaranteed": False, "limitation": LIMITATION}
-        except NativeError as exc:
-            logging.warning("execute failed bytes_written=%d unlinked=%s",
-                            exc.details.get("bytes_written", 0), exc.details.get("unlinked", False))
-            raise
-        finally:
-            self.engine.free(plan["handle"])
+            request = protocol.decode(raw)
+            if isinstance(request, dict) and protocol.valid_request_id(request.get("request_id")):
+                request_id = request["request_id"]
+            protocol.validate(request)
+            action = request["action"]
+            data = self.dispatch(request)
+            LOG.info("action=%s request_id=%s success=true bytes_written=%s",
+                     action, request_id, data.get("bytes_written", 0))
+            return protocol.response(request_id, data=data)
+        except (protocol.RequestError, NativeError) as exc:
+            error = (exc.as_dict() if isinstance(exc, NativeError) else
+                     {"code": exc.code, "message": str(exc), "details": {}})
+            LOG.info("action=%s request_id=%s success=false code=%s", action, request_id, exc.code)
+            return protocol.response(request_id, error=error)
 
 
-def handle_connection(connection, agent):
-    request_id = None
-    try:
-        _pid, uid, _gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != os.geteuid():
-            raise RequestError("unauthorized", "only clients with the service UID may connect")
-        connection.settimeout(2)
-        data = bytearray()
-        while b"\n" not in data:
-            chunk = connection.recv(4096)
-            if not chunk:
-                raise RequestError("invalid_request", "expected a newline-terminated JSON request")
-            data.extend(chunk)
-            if len(data) > MAX_MESSAGE:
-                raise RequestError("invalid_request", "request exceeds 16 KiB")
-        line, _, trailing = data.partition(b"\n")
-        if trailing.strip():
-            raise RequestError("invalid_request", "one request per connection")
-        message = json.loads(line.decode("utf-8"), object_pairs_hook=unique_object,
-                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite number")))
-        if not isinstance(message, dict):
-            raise RequestError("invalid_request", "request must be an object")
-        candidate = message.get("id")
-        if not isinstance(candidate, str) or len(candidate) > 128:
-            raise RequestError("invalid_request", "id must be a string at most 128 characters")
-        request_id = candidate
-        if type(message.get("version")) is not int or message["version"] != 1:
-            raise RequestError("invalid_request", "version must be 1")
-        if set(message) != {"version", "id", "tool", "arguments"}:
-            raise RequestError("invalid_request", "expected exactly version, id, tool, arguments")
-        result = agent.dispatch(message["tool"], message["arguments"], uid)
-        response = {"version": 1, "id": request_id, "ok": True, "result": result}
-    except NativeError as exc:
-        response = {"version": 1, "id": request_id, "ok": False,
-                    "error": {"code": "native_error", "message": str(exc), "details": exc.details}}
-    except RequestError as exc:
-        response = {"version": 1, "id": request_id, "ok": False,
-                    "error": {"code": exc.code, "message": str(exc)}}
-    except (ValueError, UnicodeError, RecursionError, socket.timeout) as exc:
-        response = {"version": 1, "id": request_id, "ok": False,
-                    "error": {"code": "invalid_request", "message": "malformed JSON, encoding, or request timeout"}}
-        logging.debug("request rejected: %s", exc)
-    except OSError:
-        logging.warning("connection failed")
-        return
-    try:
-        connection.sendall(json.dumps(response, ensure_ascii=True, allow_nan=False).encode() + b"\n")
-    except OSError:
-        logging.warning("reply not delivered; execution may have completed; do not blindly retry")
+def peer_allowed(connection):
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _, uid, _ = struct.unpack("3i", credentials)
+    return uid == os.geteuid()
 
 
-def serve(agent, socket_path):
-    path = Path(socket_path).absolute()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    parent = path.parent.lstat()
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
-        raise RuntimeError("socket directory must be owned by the service UID and mode 0700")
-    lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
-    server = None
-    socket_identity = None
-    previous_handlers = {}
-    try:
-        lock_stat = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.geteuid() or lock_stat.st_nlink != 1:
-            raise RuntimeError("unsafe service lock file")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if path.exists() or path.is_symlink():
-            if not stat.S_ISSOCK(path.lstat().st_mode):
-                raise RuntimeError("socket path exists and is not a socket")
+def receive_line(connection, limit, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    raw = bytearray()
+    while b"\n" not in raw:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise protocol.RequestError("REQUEST_TIMEOUT", "Timed out waiting for one JSON line")
+        connection.settimeout(remaining)
+        try:
+            chunk = connection.recv(min(4096, limit + 1 - len(raw)))
+        except socket.timeout as exc:
+            raise protocol.RequestError("REQUEST_TIMEOUT", "Timed out waiting for one JSON line") from exc
+        if not chunk:
+            raise protocol.RequestError("INVALID_FRAME", "Request must end with a newline")
+        raw.extend(chunk)
+        if len(raw) > limit:
+            raise protocol.RequestError("REQUEST_TOO_LARGE", "JSON line exceeds the size limit")
+    line, rest = bytes(raw).split(b"\n", 1)
+    if rest:
+        raise protocol.RequestError("INVALID_FRAME", "Use one JSON line per connection")
+    return line
+
+
+class Server:
+    def __init__(self, agent, socket_path):
+        self.agent, self.socket_path = agent, os.fspath(socket_path)
+        self.stopping = False
+        self.listen = None
+        self.parent_fd = self.lock_fd = -1
+        self.socket_identity = None
+
+    def _stop(self, _signum, _frame):
+        self.stopping = True
+
+    def start(self):
+        path = Path(self.socket_path)
+        if not path.is_absolute() or len(os.fsencode(path)) > 100:
+            raise ValueError("Socket needs an absolute path no longer than 100 bytes")
+        if self.socket_path != str(path):
+            raise ValueError("Socket path must have canonical components")
+        self.parent_fd = open_absolute_directory(str(path.parent))
+        parent = os.fstat(self.parent_fd)
+        if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise ValueError("Socket directory must be owned by you with mode 0700")
+        # Lock both the data root and socket directory to prevent multiple
+        # instances, including instances configured with different sockets.
+        self.lock_fd = os.open(".agent13-service.lock", os.O_RDWR | os.O_CREAT |
+                               os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                               dir_fd=self.agent.backend.root_fd)
+        lock = os.fstat(self.lock_fd)
+        if not stat.S_ISREG(lock.st_mode) or lock.st_uid != os.geteuid() or lock.st_nlink != 1 or stat.S_IMODE(lock.st_mode) != 0o600:
+            raise ValueError("Unsafe service lock file")
+        fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Lock the directory inode itself; no extra socket-side lock filename.
+        fcntl.flock(self.parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            old = os.stat(path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            old = None
+        if old:
+            if not stat.S_ISSOCK(old.st_mode) or old.st_uid != os.geteuid():
+                raise ValueError("Refusing to replace a non-socket or foreign socket")
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(0.2)
                 try:
-                    probe.connect(str(path))
-                except ConnectionRefusedError:
-                    path.unlink()
+                    probe.connect(self.socket_path)
+                except OSError as exc:
+                    if exc.errno != errno.ECONNREFUSED:
+                        raise
                 else:
-                    raise RuntimeError("socket already has an active listener")
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(path))
-        socket_identity = path.lstat().st_ino
-        os.chmod(path, 0o600)
-        server.listen(16)
-        server.settimeout(0.5)
-        stopping = False
+                    raise ValueError("Socket already has an active listener")
+            os.unlink(path.name, dir_fd=self.parent_fd)
+        self.listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listen.bind(self.socket_path)
+        created = os.stat(path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        self.socket_identity = (created.st_dev, created.st_ino)
+        os.chmod(path.name, 0o600, dir_fd=self.parent_fd, follow_symlinks=False)
+        self.listen.listen(16)
+        self.listen.setblocking(False)
 
-        def stop(_signum, _frame):
-            nonlocal stopping
-            stopping = True  # Finish an in-flight overwrite before closing fds.
-
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            previous_handlers[signum] = signal.signal(signum, stop)
-        logging.info("agent13 ready pid=%d uid=%d", os.getpid(), os.geteuid())
-        while not stopping:
-            agent.expire()
+    def close(self):
+        if self.listen:
+            self.listen.close()
+        if self.socket_identity and self.parent_fd >= 0:
             try:
-                connection, _ = server.accept()
-            except socket.timeout:
-                continue
-            with connection:
-                handle_connection(connection, agent)
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        if server:
-            server.close()
-        if socket_identity is not None:
-            try:
-                if path.lstat().st_ino == socket_identity and stat.S_ISSOCK(path.lstat().st_mode):
-                    path.unlink()
+                current = os.stat(Path(self.socket_path).name, dir_fd=self.parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == self.socket_identity:
+                    os.unlink(Path(self.socket_path).name, dir_fd=self.parent_fd)
             except FileNotFoundError:
                 pass
-        os.close(lock_fd)
+        for fd in (self.lock_fd, self.parent_fd):
+            if fd >= 0:
+                os.close(fd)
+        self.lock_fd = self.parent_fd = -1
+        self.agent.tokens.clear()
+
+    def serve(self):
+        wake_read, wake_write = socket.socketpair()
+        wake_read.setblocking(False)
+        wake_write.setblocking(False)
+        previous_fd = signal.set_wakeup_fd(wake_write.fileno())
+        previous_handlers = {s: signal.signal(s, self._stop) for s in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            self.start()
+            LOG.info("service_ready agent_id=13")
+            with selectors.DefaultSelector() as selector:
+                selector.register(self.listen, selectors.EVENT_READ)
+                selector.register(wake_read, selectors.EVENT_READ)
+                while not self.stopping:
+                    for key, _ in selector.select():
+                        if key.fileobj is wake_read:
+                            wake_read.recv(4096)
+                            continue
+                        if self.stopping:
+                            break
+                        try:
+                            connection, _ = self.listen.accept()
+                        except BlockingIOError:
+                            continue
+                        with connection:
+                            try:
+                                if not peer_allowed(connection):
+                                    raise protocol.RequestError("UNAUTHORIZED", "Peer UID is not the service UID")
+                                raw = receive_line(connection, protocol.MAX_REQUEST)
+                                result = self.agent.handle(raw)
+                            except protocol.RequestError as exc:
+                                result = protocol.response(error={"code": exc.code, "message": str(exc), "details": {}})
+                            except (ConnectionResetError, BrokenPipeError):
+                                LOG.info("client_disconnected")
+                                continue
+                            try:
+                                connection.settimeout(2)
+                                connection.sendall(protocol.encode(result))
+                            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                                LOG.info("client_disconnected")
+        finally:
+            self.close()
+            signal.set_wakeup_fd(previous_fd)
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            wake_read.close()
+            wake_write.close()
+            LOG.info("service_stopped")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Agent 13 background service (normally launched by systemd)")
-    parser.add_argument("--root", required=True, help="existing private directory containing eligible files")
-    parser.add_argument("--socket", default=default_socket())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allowed-root", required=True, help="Existing private directory, mode 0700")
+    parser.add_argument("--socket", required=True, help="Socket inside an existing private directory")
+    parser.add_argument("--token-ttl", type=int, default=60)
     parser.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
-    parser.add_argument("--plan-ttl", type=int, default=120)
-    parser.add_argument("--max-plans", type=int, default=32)
-    parser.add_argument("--library", help="explicit path to trusted libagent13.so")
     args = parser.parse_args(argv)
-    if not 1 <= args.max_bytes <= 1024 ** 3 or not 1 <= args.plan_ttl <= 3600 or not 1 <= args.max_plans <= 256:
-        parser.error("limits: max-bytes 1..1 GiB, plan-ttl 1..3600, max-plans 1..256")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not 1 <= args.token_ttl <= 3600 or args.max_bytes < 0:
+        parser.error("token-ttl must be 1..3600 seconds; max-bytes must be nonnegative")
     os.umask(0o077)
-    agent = None
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        agent = Agent(args.root, args.max_bytes, args.plan_ttl, args.max_plans, args.library)
-        serve(agent, args.socket)
-    except (OSError, RuntimeError, NativeError) as exc:
-        logging.error("service stopped: %s", exc)
+        with Backend(args.allowed_root) as backend:
+            Server(Agent(backend, args.token_ttl, args.max_bytes), args.socket).serve()
+    except (OSError, ValueError) as exc:
+        LOG.error("startup_or_service_failure: %s", exc)
         return 1
-    finally:
-        if agent:
-            agent.close()
     return 0
 
 

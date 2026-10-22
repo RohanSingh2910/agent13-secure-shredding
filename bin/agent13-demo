@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Demonstrate the independent service using only disposable temporary files."""
+
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+PROJECT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT))
+from agent13.client import call
+
+
+def main():
+    os.umask(0o077)
+    with tempfile.TemporaryDirectory(prefix="agent13-demo-") as folder:
+        base = Path(folder)
+        allowed = base / "allowed"
+        allowed.mkdir(mode=0o700)
+        target = allowed / "disposable.txt"
+        target.write_bytes(b"Agent 13 disposable demonstration data.\n" * 100)
+        sock = base / "agent13.sock"
+        with (base / "service.log").open("w+") as log:
+            def start():
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "agent13.service", "--allowed-root", str(allowed),
+                     "--socket", str(sock)], cwd=PROJECT, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=log, start_new_session=True)
+                for _ in range(250):
+                    if process.poll() is not None:
+                        log.seek(0)
+                        raise RuntimeError(log.read())
+                    if sock.exists():
+                        try:
+                            if call(sock, "health", timeout=0.2)["success"]:
+                                return process
+                        except (OSError, ValueError):
+                            pass
+                    time.sleep(0.01)
+                process.terminate()
+                process.wait(timeout=5)
+                raise RuntimeError("Service startup timed out")
+
+            def cli(*args, expected=0):
+                result = subprocess.run(
+                    [str(PROJECT / "bin/agent13ctl"), "--socket", str(sock), *args],
+                    cwd=PROJECT, capture_output=True, text=True, timeout=10)
+                if result.returncode != expected:
+                    raise RuntimeError(result.stdout + result.stderr)
+                return json.loads(result.stdout)
+
+            process = start()
+            try:
+                print("Service started independently, with no terminal input or master agent.")
+                print("Health:", cli("health")["data"]["status"])
+                inspected = cli("inspect", str(target))
+                print("Inspected disposable file:", inspected["data"]["file"]["size"], "bytes")
+                preview = cli("shred", str(target))
+                if not target.exists() or not preview["data"]["dry_run"]:
+                    raise RuntimeError("Dry-run verification failed")
+                print("Default dry-run preserved the file and returned a confirmation token.")
+                result = cli("shred", str(target), "--confirm-token", preview["data"]["confirm_token"])
+                if target.exists() or not result["data"]["unlinked"]:
+                    raise RuntimeError("Removal verification failed")
+                print("Confirmed overwrite:", result["data"]["bytes_written"], "bytes; file removed.")
+                reused = cli("shred", str(target), "--confirm-token", preview["data"]["confirm_token"], expected=1)
+                print("Token reuse rejected:", reused["error"]["code"])
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
+                if process.returncode or sock.exists():
+                    raise RuntimeError("Graceful shutdown verification failed")
+                print("Graceful stop removed the socket.")
+                process = start()
+                print("Restart health:", cli("health")["data"]["status"])
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            log.seek(0)
+            print("Service logs (no paths, file contents, or tokens):")
+            print(log.read().rstrip())
+        print("Demonstration complete; temporary files cleaned up.")
+
+
+if __name__ == "__main__":
+    main()

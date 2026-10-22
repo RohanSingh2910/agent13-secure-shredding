@@ -1,0 +1,15 @@
+{
+  "manifest_version": "1.0",
+  "contract_status": "provisional; class-wide contract not finalized",
+  "agent_id": 13,
+  "name": "Secure Shredding Agent",
+  "phase": "A: independent service",
+  "transport": {"type": "unix_stream", "framing": "one UTF-8 JSON line per connection", "protocol_version": "1.0", "socket": "$XDG_RUNTIME_DIR/agent13/agent13.sock"},
+  "tools": [
+    {"name": "health", "action": "health", "description": "Check service health without touching file data", "destructive": false, "parameters": {"type": "object", "properties": {}, "additionalProperties": false}},
+    {"name": "inspect_target", "action": "inspect_target", "description": "Inspect an eligible file without modifying it", "destructive": false, "parameters": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false}},
+    {"name": "preview_shred", "action": "preview_shred", "description": "Dry run; issue a single-use expiring confirmation token bound to the path and file fingerprint", "destructive": false, "parameters": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false}},
+    {"name": "execute_shred", "action": "execute_shred", "description": "DESTRUCTIVE: use only after explicit user confirmation of a preview. Overwrite one random pass, fsync, and unlink. Complete physical erasure is not guaranteed. Never automatically retry.", "destructive": true, "requires_user_confirmation": true, "parameters": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1}, "confirm_token": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["path", "confirm_token"], "additionalProperties": false}}
+  ],
+  "notes": ["No master shell, LLM, router, registry, or central dispatcher is implemented.", "A token establishes protocol confirmation, not proof of human intent; future callers must obtain the user's explicit approval.", "Same-UID socket access is required; do not expose this API over a network."]
+}

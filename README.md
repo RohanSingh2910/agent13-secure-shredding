@@ -1,186 +1,149 @@
-# Agent 13 — Secure Shredding Service
+# Agent 13 — Secure Shredding Agent
 
-Part 13 of the Operating Systems Lab **Agentic Shell** project. A persistent
-per-user systemd service exposes file-overwrite tools through a CLI and local
-JSON API. The overwrite engine is C, with a public C header and shared/static
-libraries. The daemon and CLI use Python's standard library only.
+A complete, independent, headless **Ubuntu/Debian user service** for Phase A
+of the 35-agent Agentic Shell class project. The CLI sends JSON over a Unix
+domain socket to a Python service. Python calls a C shared library through
+ctypes; C overwrites one random pass, calls fsync, and unlinks the file.
+No master shell, LLM, web server, GUI, or other agent is required.
 
-Read [ROADMAP.md](ROADMAP.md) first: it was written before implementation.
-The assignment itself is in [Project_Overview.txt](Project_Overview.txt).
+**Best effort only:** overwriting cannot guarantee complete physical erasure
+on all storage technologies. Read [limitations](docs/SECURITY.md) before use.
+Use disposable sample files for this project.
 
-## What it does
+## Build and test on Ubuntu/Debian
 
-`plan` opens and locks one eligible file without changing its contents. It returns
-the path, inode, size, overwrite options, limitations, and a single-use token.
-`execute` validates that prepared file, writes random bytes over its logical
-contents in 64 KiB chunks, synchronizes each pass, optionally adds a zero pass,
-unlinks the file, and synchronizes the parent directory. `cancel` releases the
-plan. The service remains running between commands.
-
-The default root is `~/agent13-vault`. Only relative paths inside that directory
-are accepted. The service refuses to run as root. It rejects symlinks, hard-linked
-files, directories, FIFOs, unsafe permissions, sparse/compressed files detected
-by allocation accounting, and files larger than 64 MiB by default. It supports
-one file per operation, without recursive deletion or wildcard expansion.
-
-**Physical erasure is not guaranteed.** File overwriting can leave copies on
-SSDs, copy-on-write storage, snapshots, backups and journals. The agent reports
-best-effort logical overwrite and unlink, never “cannot be recovered.” See the
-[GNU shred manual](https://www.gnu.org/software/coreutils/manual/html_node/shred-invocation.html)
-and [docs/DESIGN.md](docs/DESIGN.md). Test with disposable files.
-
-## Step 1 — Build on Ubuntu 22.04.5 LTS
-
-Use a normal user account. Ubuntu is the deployment target; Debian packages supply
-the build tools. There is no pip installation, downloaded C library, kernel
-patch, or custom kernel header requirement.
+Requirements: ordinary Linux user, Python 3.10+, GCC/C11, Make, Linux/glibc
+headers. No pip packages are needed. Install packages yourself if missing:
 
 ```bash
 sudo apt update
 sudo apt install build-essential python3
-cd /path/to/OS_Project
 make
 make check
+./bin/agent13-demo
 ```
 
-Expected outputs: `build/libagent13.so`, `build/libagent13.a`, and passing C and
-Python tests. The tests create and delete their own disposable temporary files.
-Unix sockets must be allowed in the test environment. Run the tests as a non-root
-user. Rebuild on Ubuntu: binaries built on a newer distribution may require a
-newer glibc. Current validation results are in [docs/VALIDATION.md](docs/VALIDATION.md).
-
-## Step 2 — Install and start the background service
-
-Install for your own account; no administrator permission is needed for this
-step. These commands install files and explicitly enable the service:
+`make` builds `build/libagent13_shred.so`. The explicit compiler command is:
 
 ```bash
-make install PREFIX="$HOME/.local"
-install -d -m 700 "$HOME/agent13-vault"
+gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -fPIC -shared \
+  -Iinclude -o build/libagent13_shred.so src/c/agent13_shred.c
+```
+
+Create `build` first if using that command directly. `make check` compiles and
+runs native fault-injection tests plus Python unittest tests. The automated
+demo launches its own background service, checks health, inspects and previews
+a temporary sample, confirms deletion, verifies removal, shows logs, and
+stops/restarts the service. It does not install anything. See
+[test evidence](docs/TESTING.md) and [professor demo](docs/DEMO.md).
+
+## Install the systemd user service
+
+These are **manual opt-in commands**. Development/testing does not install or
+enable a host service. From the project directory, after `make check`:
+
+```bash
+install -d -m 700 "$HOME/.local/lib/agent13"
+cp -a agent13 bin build docs include src manifests config systemd Makefile README.md \
+  "$HOME/.local/lib/agent13/"
+install -d -m 700 "$HOME/.local/share/agent13/allowed"
+install -d "$HOME/.config/systemd/user" "$HOME/.local/bin"
+install -m 644 systemd/agent13.service "$HOME/.config/systemd/user/agent13.service"
+ln -s "$HOME/.local/lib/agent13/bin/agent13ctl" "$HOME/.local/bin/agent13ctl"
+export PATH="$HOME/.local/bin:$PATH"
 systemctl --user daemon-reload
-systemctl --user enable --now agent13.service
-"$HOME/.local/bin/agent13" health
+systemctl --user start agent13
+systemctl --user status agent13 --no-pager
+agent13ctl health
 ```
 
-The unit is installed in `~/.local/lib/systemd/user/agent13.service`. It starts
-Python as a foreground service process; systemd supervises it. There is no UI,
-interactive daemon prompt, or double-fork. The CLI is a separate, short-lived
-client. A user service starts with the user's service manager (normally at login).
-For startup without a login, an administrator can enable lingering with
-`sudo loginctl enable-linger "$USER"`; that is optional.
-
-Inspect or stop it with:
+Keep the checkout separate from the installed destination. If the CLI symlink
+already exists, inspect it before replacing it. The service's existing allowed
+directory must be owned by you with mode 0700. It refuses to run as root.
+The unit creates a mode-0700 runtime directory and mode-0600 socket.
 
 ```bash
-systemctl --user status agent13.service
-journalctl --user -u agent13.service -n 30 --no-pager
-systemctl --user disable --now agent13.service
+systemctl --user restart agent13
+systemctl --user enable agent13
+journalctl --user -u agent13.service -n 50 --no-pager
+systemctl --user stop agent13
+systemctl --user disable agent13
 ```
 
-## Step 3 — Demonstrate with synthetic lab data
+Enable starts the service at future user-manager startup/login. This project
+does not enable lingering after logout. A normal logged-in systemd user
+session is required; a container without a user manager can use the direct
+service/demo instead. Installation and live systemd start/stop were not
+performed during development; the supplied unit was validated separately.
 
-After starting the service, create this example file, which contains no real
-personal information:
+## CLI workflow
+
+Create only a disposable sample in the configured allowed directory:
 
 ```bash
-printf 'DISPOSABLE OS LAB TAX RETURN EXAMPLE\n' > "$HOME/agent13-vault/lab-example.txt"
-chmod 600 "$HOME/agent13-vault/lab-example.txt"
-"$HOME/.local/bin/agent13" plan lab-example.txt --passes 1 --zero-pass
+umask 077
+printf 'Disposable classroom sample\n' > "$HOME/.local/share/agent13/allowed/sample.txt"
+agent13ctl info
+agent13ctl inspect sample.txt
+agent13ctl preview sample.txt
+agent13ctl shred sample.txt
 ```
 
-Read the JSON plan and copy its `token`. It expires after 120 seconds. To delete
-the exact file in that plan:
+The last command is also a **dry run**. Read the preview and copy its
+`data.confirm_token` into the following command within 60 seconds:
 
 ```bash
-"$HOME/.local/bin/agent13" execute 'PASTE_TOKEN_HERE' --acknowledge-limitations
+agent13ctl shred sample.txt --confirm-token 'PASTE_THE_PREVIEW_TOKEN_HERE'
+test ! -e "$HOME/.local/share/agent13/allowed/sample.txt"
 ```
 
-The successful result contains `status: overwritten_and_unlinked`, write counts,
-`unlinked: true`, `directory_synced: true`, and
-`physical_erasure_guaranteed: false`. To leave the file intact instead:
+Each execution attempt consumes a known token. A changed file, different path,
+expired/reused token, or service restart requires a fresh preview. CLI output
+is JSON: exit 0 means success, 1 service failure, 2 usage/transport failure.
+On a timeout, execution may have completed; inspect before retrying. The CLI
+contains no shredding implementation.
+
+## Run directly without installing systemd configuration
+
+Create separate private directories for disposable files and the socket,
+then launch the process with explicit configuration:
 
 ```bash
-"$HOME/.local/bin/agent13" cancel 'PASTE_TOKEN_HERE'
+./bin/agent13d --allowed-root /absolute/private/allowed \
+  --socket /absolute/private/runtime/agent13.sock
+./bin/agent13ctl --socket /absolute/private/runtime/agent13.sock health
 ```
 
-CLI exit codes: **0** success, **1** service refusal/native failure, **2** invalid
-CLI input or connection failure. If a connection fails after execution was sent,
-check the file and journal before retrying; the operation may have completed.
+The service can run without terminal input. SIGTERM/SIGINT gracefully finish
+the current operation and remove its socket; systemd supplies background
+process management in normal use. [Configuration](config/README.md) documents
+limits and socket selection.
 
-An independent automated demo runs entirely in a temporary directory:
+## Design and project files
 
-```bash
-python3 examples/demo.py
+```text
+User -> CLI -> Unix socket -> Python service -> Safety checks -> ctypes
+  -> C shared library -> Linux system calls -> Allowed filesystem directory
 ```
 
-## Step 4 — Integrate with all 35 agents
+Python keeps JSON, IPC, confirmation state, logging, and CLI code readable.
+C demonstrates real Linux system calls and handles descriptor-based file
+operations. The library never shells out to an external shred command.
+`openat`/`O_NOFOLLOW`, `fstat`, `flock`, `renameat2`, `getrandom`, `write`,
+`fsync`, and `unlinkat` are explained in [architecture](docs/ARCHITECTURE.md)
+and [security](docs/SECURITY.md).
 
-Give the class integration owner:
+| File/directory | Purpose |
+| --- | --- |
+| `docs/ROADMAP.md` | Requirements and staged milestones, written first |
+| `docs/ARCHITECTURE.md` | Six Mermaid diagrams and ASCII overview, written before code |
+| `include/`, `src/c/` | Documented C ABI and implementation |
+| `agent13/` | ctypes wrapper, protocol, service, client, CLI |
+| `bin/` | Service, CLI, disposable demonstration entry points |
+| `systemd/agent13.service` | User-service unit |
+| `manifests/agent13.tools.json` | Proposed future tool definitions |
+| `docs/API.md`, `docs/INTEGRATION.md` | Versioned public interfaces; future class integration |
+| `docs/TESTING.md`, `docs/DEMO.md` | Test evidence, safe demo, viva preparation |
 
-- `integration/tools.json` — function-calling definitions for health, plan,
-  execute and cancel.
-- `examples/class_shell_adapter.py` and `agent13/client.py` — deterministic
-  dispatch over the Unix socket, with exact-token approval in the master shell.
-- `include/agent13.h` and the compiled library — a C API alternative.
-- [docs/INTEGRATION.md](docs/INTEGRATION.md) — protocol and integration contract.
-
-The master shell's LLM routes a prompt such as “delete my lab tax return” to
-agent 13 and selects a tool. It must identify the exact file, call `agent13_plan`,
-display the plan, and obtain human authorization before `agent13_execute`.
-The adapter takes the approved token from the master's approval flow, separately
-from the model's arguments. Run the master as the service's Unix user. The
-service cannot itself distinguish a human-approved request from another process
-of that same user setting the acknowledgement field.
-
-For a unified class package, keep the C module and install the Python package
-inside the master project's namespace or use the socket API. A genuine new
-kernel system call is unnecessary: this project uses existing Linux system
-calls behind a userspace API.
-
-## Step 5 — Build a Debian package (optional integration route)
-
-On Ubuntu 22.04, as a normal user:
-
-```bash
-sudo apt install debhelper dpkg-dev
-dpkg-buildpackage -us -uc -b
-sudo apt install ../agent13_1.0.0_*.deb
-install -d -m 700 "$HOME/agent13-vault"
-systemctl --user daemon-reload
-systemctl --user enable --now agent13.service
-agent13 health
-```
-
-This installs `/usr/bin/agent13`, `/usr/lib/agent13/`, the C header/static library,
-documentation and a systemd user unit. Replace the illustrative maintainer
-identity in `debian/control` and `debian/changelog` with the class's real identity
-before public distribution. The supplied GitHub workflow builds/tests/packages
-on Ubuntu 22.04 once this project is placed in a GitHub repository.
-
-## Changing the configured root or limits
-
-Use `systemctl --user edit agent13.service` and replace the startup command.
-For a user installation, for example:
-
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/bin/python3 %h/.local/lib/agent13/run_service.py --root %h/agent13-vault --socket %t/agent13/control.sock --max-bytes 134217728 --plan-ttl 180
-```
-
-Then run `systemctl --user daemon-reload` and
-`systemctl --user restart agent13.service`. The root must already exist, be owned
-by your account and have mode 0700. Child directories must give your account rwx
-permission and not be writable by group/others; files must be writable by you and not
-writable by group/others. Keep service executables outside the allowed root.
-
-Limits: 1–7 random passes (default 3), optional extra zero pass, file-size ceiling
-1 GiB (default 64 MiB), token lifetime 1–3600 seconds, and 1–256 pending plans
-(default 32). The daemon processes requests sequentially. A large overwrite
-blocks other tool calls until it finishes. Shutdown finishes the current
-operation when possible; crashes, power failures or SIGKILL can interrupt it.
-
-## Lab explanation
-
-Read [docs/VIVA.md](docs/VIVA.md) for the service architecture, C headers, OS calls,
-inode behavior, synchronization, tradeoffs and demonstration sequence.
+Phase B/C integration is future work. A future master should call the same
+socket API; no central shell or dispatcher is implemented here.

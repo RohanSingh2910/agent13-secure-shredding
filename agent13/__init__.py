@@ -1,3 +1,3 @@
-"""Part 13 tools for the class Agentic Shell (no third-party dependencies)."""
+"""Agent 13: standalone, best-effort secure shredding service."""
 
 __version__ = "1.0.0"
